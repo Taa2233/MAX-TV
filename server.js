@@ -1,93 +1,57 @@
+'use strict';
 const express = require('express');
-const { Pool } = require('pg');
+const {Pool} = require('pg');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '16kb' }));
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5 });
+app.set('trust proxy', 1);
+app.use(express.json({limit:'16kb'}));
+const pool = new Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:false},max:5});
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
-const code = () => 'MAX-' + crypto.randomBytes(12).toString('hex').toUpperCase();
-const safeEqual = (a,b) => { const x=Buffer.from(a||''); const y=Buffer.from(b||''); return x.length===y.length && crypto.timingSafeEqual(x,y); };
-const admin = (req,res,next) => safeEqual(req.get('x-admin-secret'),process.env.ADMIN_SECRET) && process.env.ADMIN_SECRET ? next() : res.status(403).json({error:'Forbidden'});
-const deviceOk = x => typeof x === 'string' && /^[a-f0-9]{64}$/i.test(x);
+const code = () => 'MAX-'+crypto.randomBytes(12).toString('hex').toUpperCase();
 const token = () => crypto.randomBytes(32).toString('hex');
+const safeEqual = (a,b) => {const x=Buffer.from(a||'');const y=Buffer.from(b||'');return x.length===y.length&&crypto.timingSafeEqual(x,y);};
+const admin = (req,res,next) => process.env.ADMIN_SECRET&&safeEqual(req.get('x-admin-secret'),process.env.ADMIN_SECRET)?next():res.status(403).json({error:'Forbidden'});
+const deviceOk = x => typeof x==='string'&&/^[a-f0-9]{64}$/i.test(x);
 const loginLimiter = new Map();
-function limit(req,res,next) {
-  const key = req.ip + ':' + req.path;
-  const now=Date.now(); const old=loginLimiter.get(key);
-  const entry= !old || old.until<now ? {count:0,until:now+15*60*1000} : old;
-  entry.count++; loginLimiter.set(key,entry);
-  if(loginLimiter.size>5000) for(const [k,v] of loginLimiter) if(v.until<now) loginLimiter.delete(k);
-  if(entry.count>20) return res.status(429).json({error:'Too many attempts; retry later'});
-  next();
-}
-
-app.get('/', (_req,res)=>res.json({app:'MAX TV',status:'online'}));
-app.get('/api/health', async (_req,res)=>{try{await pool.query('SELECT 1');res.json({status:'ok',database:'connected'});}catch(e){console.error('DATABASE ERROR:',e.message);res.status(503).json({status:'error',database:'disconnected'});}});
-
-// Call once only; existing 200 codes are preserved.
-app.post('/api/admin/generate-codes',admin,async(_req,res)=>{
- const client=await pool.connect();
- try {await client.query('BEGIN'); const codes=[];
-  for(const days of [30,90]) for(let i=0;i<100;i++) {const value=code();await client.query('INSERT INTO public.max_tv_activation_codes(code_hash,duration_days) VALUES($1,$2)',[sha(value),days]);codes.push({code:value,duration_days:days});}
-  await client.query('COMMIT');res.json({created:codes.length,codes});
- }catch(e){await client.query('ROLLBACK');console.error(e);res.status(500).json({error:'Generation failed'});}finally{client.release();}
-});
-
+function limit(req,res,next){const key=req.ip+':'+req.path;const now=Date.now();const old=loginLimiter.get(key);const entry=!old||old.until<now?{count:0,until:now+15*60*1000}:old;entry.count++;loginLimiter.set(key,entry);if(loginLimiter.size>5000)for(const[k,v]of loginLimiter)if(v.until<now)loginLimiter.delete(k);if(entry.count>20)return res.status(429).json({error:'Too many attempts; retry later'});next();}
+app.get('/',(_req,res)=>res.json({app:'MAX TV',status:'online'}));
+app.get('/api/health',async(_req,res)=>{try{await pool.query('SELECT 1');res.json({status:'ok',database:'connected'});}catch(e){console.error('DB',e.message);res.status(503).json({status:'error',database:'disconnected'});}});
+// Existing codes are preserved. Do not call this route again unless creating another batch.
+app.post('/api/admin/generate-codes',admin,async(_req,res)=>{const client=await pool.connect();try{await client.query('BEGIN');const codes=[];for(const days of [30,90])for(let i=0;i<100;i++){const value=code();await client.query('INSERT INTO public.max_tv_activation_codes(code_hash,duration_days) VALUES($1,$2)',[sha(value),days]);codes.push({code:value,duration_days:days});}await client.query('COMMIT');res.json({created:codes.length,codes});}catch(e){await client.query('ROLLBACK');console.error(e);res.status(500).json({error:'Generation failed'});}finally{client.release();}});
+const validUsername = s => typeof s==='string'&&/^[a-zA-Z0-9_]{3,32}$/.test(s);
+const validPassword = s => typeof s==='string'&&s.length>=12&&s.length<=128;
+const validDeviceName = s => typeof s==='string'&&s.trim().length>=1&&s.trim().length<=60;
+async function issueSession(client,userId,deviceHash){const session=token();await client.query("INSERT INTO public.max_tv_sessions(user_id,device_hash,token_hash,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '30 days')",[userId,deviceHash,sha(session)]);return session;}
 app.post('/api/activate',limit,async(req,res)=>{
- const {username,password,code:activationCode,device_hash}=req.body||{};
- if(typeof username!=='string'|| !/^[a-zA-Z0-9_]{3,32}$/.test(username)||typeof password!=='string'||password.length<12||password.length>128||typeof activationCode!=='string'|| !/^MAX-[A-F0-9]{24}$/.test(activationCode)||!deviceOk(device_hash)) return res.status(400).json({error:'Invalid input'});
- const passHash=await bcrypt.hash(password,12);
- const client=await pool.connect();
- try {await client.query('BEGIN');
-  const activation=await client.query('SELECT id,duration_days FROM public.max_tv_activation_codes WHERE code_hash=$1 AND user_id IS NULL FOR UPDATE',[sha(activationCode)]);
-  if(!activation.rowCount){await client.query('ROLLBACK');return res.status(400).json({error:'Invalid or used code'});}
-  const user=(await client.query('INSERT INTO public.max_tv_users(username,password_hash) VALUES($1,$2) RETURNING id,username',[username,passHash])).rows[0];
-  await client.query("UPDATE public.max_tv_activation_codes SET user_id=$1,activated_at=NOW(),expires_at=NOW()+($2 * INTERVAL '1 day') WHERE id=$3",[user.id,activation.rows[0].duration_days,activation.rows[0].id]);
-  await client.query('INSERT INTO public.max_tv_devices(user_id,device_hash,device_slot) VALUES($1,$2,1)',[user.id,device_hash.toLowerCase()]);
-  const session=token(); await client.query('INSERT INTO public.max_tv_sessions(user_id,device_hash,token_hash,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL \'30 days\')',[user.id,device_hash.toLowerCase(),sha(session)]);
-  await client.query('COMMIT');res.status(201).json({success:true,username:user.username,duration_days:activation.rows[0].duration_days,session_token:session});
- }catch(e){await client.query('ROLLBACK');if(e.code==='23505')return res.status(409).json({error:'Username already exists'});console.error(e);res.status(500).json({error:'Activation failed'});}finally{client.release();}
+ const {username,password,code:activationCode,device_hash,device_name}=req.body||{};
+ if(!validUsername(username)||!validPassword(password)||typeof activationCode!=='string'||!/^MAX-[A-F0-9]{24}$/.test(activationCode)||!deviceOk(device_hash)||(device_name!==undefined&&!validDeviceName(device_name)))return res.status(400).json({error:'Invalid input'});
+ const passHash=await bcrypt.hash(password,12);const client=await pool.connect();
+ try{await client.query('BEGIN');const activation=await client.query('SELECT id,duration_days FROM public.max_tv_activation_codes WHERE code_hash=$1 AND user_id IS NULL FOR UPDATE',[sha(activationCode)]);if(!activation.rowCount){await client.query('ROLLBACK');return res.status(400).json({error:'Invalid or used code'});}
+ const user=(await client.query('INSERT INTO public.max_tv_users(username,password_hash) VALUES($1,$2) RETURNING id,username',[username,passHash])).rows[0];
+ await client.query("UPDATE public.max_tv_activation_codes SET user_id=$1,activated_at=NOW(),expires_at=NOW()+($2 * INTERVAL '1 day') WHERE id=$3",[user.id,activation.rows[0].duration_days,activation.rows[0].id]);
+ const normalized=device_hash.toLowerCase();await client.query('INSERT INTO public.max_tv_devices(user_id,device_hash,device_slot,device_name) VALUES($1,$2,1,$3)',[user.id,normalized,(device_name||'جهاز جديد').trim()]);const session=await issueSession(client,user.id,normalized);await client.query('COMMIT');res.status(201).json({success:true,username:user.username,duration_days:activation.rows[0].duration_days,session_token:session});
+ }catch(e){await client.query('ROLLBACK').catch(()=>{});if(e.code==='23505')return res.status(409).json({error:'Username already exists'});console.error(e);res.status(500).json({error:'Activation failed'});}finally{client.release();}
 });
-
 app.post('/api/login',limit,async(req,res)=>{
- const {username,password,device_hash}=req.body||{};
- if(typeof username!=='string'||typeof password!=='string'||!deviceOk(device_hash))return res.status(400).json({error:'Invalid input'});
+ const {username,password,device_hash,device_name}=req.body||{};
+ if(!validUsername(username)||typeof password!=='string'||!deviceOk(device_hash)||(device_name!==undefined&&!validDeviceName(device_name)))return res.status(400).json({error:'Invalid input'});
  const client=await pool.connect();
- try {const userResult=await client.query('SELECT id,username,password_hash FROM public.max_tv_users WHERE username=$1',[username]);
-  const user=userResult.rows[0];if(!user||!(await bcrypt.compare(password,user.password_hash)))return res.status(401).json({error:'Invalid credentials'});
-  await client.query('BEGIN');
-  const sub=await client.query('SELECT expires_at FROM public.max_tv_activation_codes WHERE user_id=$1 AND expires_at>NOW() FOR UPDATE',[user.id]);
-  if(!sub.rowCount){await client.query('ROLLBACK');return res.status(403).json({error:'Subscription expired'});}
-  const devices=await client.query('SELECT device_hash,device_slot FROM public.max_tv_devices WHERE user_id=$1 FOR UPDATE',[user.id]);
-  const normalized=device_hash.toLowerCase();
-  if(!devices.rows.some(d=>d.device_hash===normalized)){
-   const used=new Set(devices.rows.map(d=>d.device_slot));const slot=[1,2,3].find(n=>!used.has(n));
-   if(!slot){await client.query('ROLLBACK');return res.status(403).json({error:'Device limit reached (3)'});}
-   await client.query('INSERT INTO public.max_tv_devices(user_id,device_hash,device_slot) VALUES($1,$2,$3)',[user.id,normalized,slot]);
-  }
-  await client.query('UPDATE public.max_tv_devices SET last_seen_at=NOW() WHERE user_id=$1 AND device_hash=$2',[user.id,normalized]);
-  const session=token();await client.query('INSERT INTO public.max_tv_sessions(user_id,device_hash,token_hash,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL \'30 days\')',[user.id,normalized,sha(session)]);
-  await client.query('COMMIT');res.json({success:true,username:user.username,session_token:session,expires_at:sub.rows[0].expires_at});
+ try{const result=await client.query('SELECT id,username,password_hash FROM public.max_tv_users WHERE username=$1',[username]);const user=result.rows[0];if(!user||!(await bcrypt.compare(password,user.password_hash)))return res.status(401).json({error:'Invalid credentials'});
+ await client.query('BEGIN');await client.query('SELECT id FROM public.max_tv_users WHERE id=$1 FOR UPDATE',[user.id]);
+ const sub=await client.query('SELECT expires_at FROM public.max_tv_activation_codes WHERE user_id=$1 AND expires_at>NOW()',[user.id]);if(!sub.rowCount){await client.query('ROLLBACK');return res.status(403).json({error:'Subscription expired'});}
+ const devices=await client.query('SELECT device_hash,device_slot FROM public.max_tv_devices WHERE user_id=$1',[user.id]);const normalized=device_hash.toLowerCase();if(!devices.rows.some(d=>d.device_hash===normalized)){const used=new Set(devices.rows.map(d=>d.device_slot));const slot=[1,2,3].find(n=>!used.has(n));if(!slot){await client.query('ROLLBACK');return res.status(403).json({error:'Device limit reached (3)'});}await client.query('INSERT INTO public.max_tv_devices(user_id,device_hash,device_slot,device_name) VALUES($1,$2,$3,$4)',[user.id,normalized,slot,(device_name||'جهاز جديد').trim()]);}
+ await client.query('UPDATE public.max_tv_devices SET last_seen_at=NOW() WHERE user_id=$1 AND device_hash=$2',[user.id,normalized]);const session=await issueSession(client,user.id,normalized);await client.query('COMMIT');res.json({success:true,username:user.username,session_token:session,expires_at:sub.rows[0].expires_at});
  }catch(e){await client.query('ROLLBACK').catch(()=>{});console.error(e);res.status(500).json({error:'Login failed'});}finally{client.release();}
 });
-
-async function auth(req,res,next){
- const bearer=req.get('authorization')||'';const match=/^Bearer ([a-f0-9]{64})$/i.exec(bearer);
- if(!match)return res.status(401).json({error:'Unauthorized'});
- try{const result=await pool.query(`SELECT s.user_id,s.device_hash,u.username,a.expires_at
- FROM public.max_tv_sessions s JOIN public.max_tv_users u ON u.id=s.user_id
- JOIN public.max_tv_devices d ON d.user_id=s.user_id AND d.device_hash=s.device_hash
- JOIN public.max_tv_activation_codes a ON a.user_id=s.user_id
- WHERE s.token_hash=$1 AND s.expires_at>NOW() AND a.expires_at>NOW()`,[sha(match[1])]);
- if(!result.rowCount)return res.status(401).json({error:'Session invalid or subscription expired'});
- req.account=result.rows[0];next();
- }catch(e){console.error(e);res.status(500).json({error:'Authentication failed'});}
-}
+async function auth(req,res,next){const bearer=req.get('authorization')||'';const match=/^Bearer ([a-f0-9]{64})$/i.exec(bearer);if(!match)return res.status(401).json({error:'Unauthorized'});try{const result=await pool.query(`SELECT s.user_id,s.device_hash,u.username,a.expires_at FROM public.max_tv_sessions s JOIN public.max_tv_users u ON u.id=s.user_id JOIN public.max_tv_devices d ON d.user_id=s.user_id AND d.device_hash=s.device_hash JOIN public.max_tv_activation_codes a ON a.user_id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>NOW() AND a.expires_at>NOW()`,[sha(match[1])]);if(!result.rowCount)return res.status(401).json({error:'Session invalid or subscription expired'});req.account=result.rows[0];req.sessionHash=sha(match[1]);next();}catch(e){console.error(e);res.status(500).json({error:'Authentication failed'});}}
 app.get('/api/me',auth,(req,res)=>res.json({username:req.account.username,expires_at:req.account.expires_at,max_devices:3}));
-app.post('/api/logout',auth,async(req,res)=>{await pool.query('DELETE FROM public.max_tv_sessions WHERE token_hash=$1',[sha(req.get('authorization').slice(7))]);res.json({success:true});});
-
-const PORT=process.env.PORT||3000;
-app.listen(PORT,'0.0.0.0',()=>console.log('MAX TV Server running on '+PORT));
+app.post('/api/logout',auth,async(req,res)=>{try{await pool.query('DELETE FROM public.max_tv_sessions WHERE token_hash=$1',[req.sessionHash]);res.json({success:true});}catch(e){res.status(500).json({error:'Logout failed'});}});
+// Rotate a valid session token on every app launch; never store passwords locally.
+app.post('/api/session/refresh',auth,async(req,res)=>{try{const newToken=token();const result=await pool.query("UPDATE public.max_tv_sessions SET token_hash=$1,expires_at=NOW()+INTERVAL '30 days' WHERE token_hash=$2 RETURNING id",[sha(newToken),req.sessionHash]);if(!result.rowCount)return res.status(401).json({error:'Session invalid'});res.json({session_token:newToken,username:req.account.username,expires_at:req.account.expires_at});}catch(e){console.error(e);res.status(500).json({error:'Refresh failed'});}});
+app.get('/api/profiles',auth,async(req,res)=>{try{const r=await pool.query('SELECT id,name,avatar FROM public.max_tv_profiles WHERE user_id=$1 ORDER BY created_at,id',[req.account.user_id]);res.json({profiles:r.rows,max_profiles:3});}catch(e){console.error(e);res.status(500).json({error:'Profiles failed'});}});
+app.post('/api/profiles',auth,async(req,res)=>{const name=req.body?.name;if(typeof name!=='string'||name.trim().length<1||name.trim().length>32)return res.status(400).json({error:'Invalid profile name'});const client=await pool.connect();try{await client.query('BEGIN');await client.query('SELECT id FROM public.max_tv_users WHERE id=$1 FOR UPDATE',[req.account.user_id]);const count=await client.query('SELECT COUNT(*)::int AS n FROM public.max_tv_profiles WHERE user_id=$1',[req.account.user_id]);if(count.rows[0].n>=3){await client.query('ROLLBACK');return res.status(403).json({error:'Profile limit reached (3)'});}const r=await client.query('INSERT INTO public.max_tv_profiles(user_id,name) VALUES($1,$2) RETURNING id,name,avatar',[req.account.user_id,name.trim()]);await client.query('COMMIT');res.status(201).json({profile:r.rows[0]});}catch(e){await client.query('ROLLBACK').catch(()=>{});console.error(e);res.status(500).json({error:'Create profile failed'});}finally{client.release();}});
+app.get('/api/devices',auth,async(req,res)=>{try{const r=await pool.query('SELECT device_hash,device_slot,device_name,created_at,last_seen_at FROM public.max_tv_devices WHERE user_id=$1 ORDER BY device_slot',[req.account.user_id]);res.json({devices:r.rows.map(d=>({...d,is_current:d.device_hash===req.account.device_hash})),max_devices:3});}catch(e){console.error(e);res.status(500).json({error:'Devices failed'});}});
+app.delete('/api/devices/:deviceHash',auth,async(req,res)=>{const deviceHash=req.params.deviceHash;if(!deviceOk(deviceHash))return res.status(400).json({error:'Invalid device'});const client=await pool.connect();try{await client.query('BEGIN');await client.query('SELECT id FROM public.max_tv_users WHERE id=$1 FOR UPDATE',[req.account.user_id]);const result=await client.query('DELETE FROM public.max_tv_devices WHERE user_id=$1 AND device_hash=$2 RETURNING device_hash',[req.account.user_id,deviceHash.toLowerCase()]);if(!result.rowCount){await client.query('ROLLBACK');return res.status(404).json({error:'Device not found'});}await client.query('DELETE FROM public.max_tv_sessions WHERE user_id=$1 AND device_hash=$2',[req.account.user_id,deviceHash.toLowerCase()]);await client.query('COMMIT');res.json({success:true,current_device_removed:deviceHash.toLowerCase()===req.account.device_hash});}catch(e){await client.query('ROLLBACK').catch(()=>{});console.error(e);res.status(500).json({error:'Remove device failed'});}finally{client.release();}});
+const PORT=process.env.PORT||3000;app.listen(PORT,'0.0.0.0',()=>console.log('MAX TV Server running on '+PORT));
